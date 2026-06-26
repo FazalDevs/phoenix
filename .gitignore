@@ -1,0 +1,9 @@
+.env
+*.exe
+/bin/
+/tmp/
+node_modules/
+.next/
+out/
+*.log
+docs/

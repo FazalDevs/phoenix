@@ -1,0 +1,8 @@
+.git
+web
+bin
+node_modules
+*.log
+.env
+docs
+deploy/migrations/*.sql.bak
