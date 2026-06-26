@@ -19,8 +19,37 @@ export default function Landing() {
           <Link href="/play">
             <button className="btn-primary">Play Chess →</button>
           </Link>
+          <Link href="/arena">
+            <button className="btn-green">⚡ Real-time Arena →</button>
+          </Link>
           <Link href="/admin">
             <button className="btn-ghost">Admin Dashboard</button>
+          </Link>
+        </div>
+        <p className="muted" style={{ marginTop: 18, fontSize: 13 }}>
+          One backend powers both — turn-based <strong>chess</strong> and a 15Hz real-time{" "}
+          <strong>arena</strong>. Same event log, same authoritative server.
+        </p>
+      </section>
+
+      <section>
+        <div className="section-title">Two games, one platform</div>
+        <div className="grid feature-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))" }}>
+          <Link href="/play" className="card feature" style={{ display: "block", color: "inherit" }}>
+            <div className="ico">♟️</div>
+            <h3>Play Chess</h3>
+            <p>
+              Authoritative turn-based chess. Quick-match, spectate, reconnect — every move is
+              an event you can replay.
+            </p>
+          </Link>
+          <Link href="/arena" className="card feature" style={{ display: "block", color: "inherit" }}>
+            <div className="ico">⚡</div>
+            <h3>Real-time Arena</h3>
+            <p>
+              Drop into a live field, roam with WASD, and eat to score. The same server clamps
+              positions ~15× a second and broadcasts to every viewer.
+            </p>
           </Link>
         </div>
       </section>

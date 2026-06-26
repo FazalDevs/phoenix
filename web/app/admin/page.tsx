@@ -1,22 +1,33 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { api, Metrics, Room, Standing } from "@/lib/api";
 
+const POLL_MS = 1500;
+const MAX_SAMPLES = 40;
+
 export default function Dashboard() {
+  const router = useRouter();
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [rooms, setRooms] = useState<Room[]>([]);
   const [board, setBoard] = useState<Standing[]>([]);
   const [eventsPerSec, setEventsPerSec] = useState<number | null>(null);
+  const [series, setSeries] = useState<number[]>([]);
   const [err, setErr] = useState<string | null>(null);
+  const [demoBusy, setDemoBusy] = useState(false);
 
   // track previous bus counter to derive events/sec
   const prev = useRef<{ published: number; t: number } | null>(null);
 
   async function refresh() {
     try {
-      const [m, r, lb] = await Promise.all([api.metrics(), api.rooms(), api.leaderboard().catch(() => [])]);
+      const [m, r, lb] = await Promise.all([
+        api.metrics(),
+        api.rooms(),
+        api.leaderboard().catch(() => [] as Standing[]),
+      ]);
       setMetrics(m);
       setRooms(r);
       setBoard(lb as Standing[]);
@@ -26,7 +37,11 @@ export default function Dashboard() {
         const now = Date.now();
         if (prev.current) {
           const dt = (now - prev.current.t) / 1000;
-          if (dt > 0) setEventsPerSec(Math.max(0, (m.events_published - prev.current.published) / dt));
+          if (dt > 0) {
+            const eps = Math.max(0, (m.events_published - prev.current.published) / dt);
+            setEventsPerSec(eps);
+            setSeries((s) => [...s, eps].slice(-MAX_SAMPLES));
+          }
         }
         prev.current = { published: m.events_published, t: now };
       }
@@ -37,8 +52,9 @@ export default function Dashboard() {
 
   useEffect(() => {
     refresh();
-    const t = setInterval(refresh, 2000);
+    const t = setInterval(refresh, POLL_MS);
     return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function terminate(id: string) {
@@ -50,6 +66,17 @@ export default function Dashboard() {
     refresh();
   }
 
+  async function launchDemo() {
+    setDemoBusy(true);
+    try {
+      const res = await api.launchDemo(8);
+      router.push(`/admin/rooms/${res.room}`);
+    } catch (e: any) {
+      setErr(e.message || "could not launch demo");
+      setDemoBusy(false);
+    }
+  }
+
   function statusClass(s: string) {
     if (s === "open" || s === "waiting") return "open";
     if (s === "active" || s === "playing") return "playing";
@@ -58,11 +85,24 @@ export default function Dashboard() {
 
   return (
     <div className="container grid" style={{ gap: 24 }}>
-      <div>
-        <h1 style={{ margin: "8px 0" }}>Admin Dashboard</h1>
-        <p className="muted" style={{ margin: 0 }}>
-          Live operational view of the Phoenix backend · auto-refresh 2s
-        </p>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: 12,
+        }}
+      >
+        <div>
+          <h1 style={{ margin: "8px 0" }}>Mission Control</h1>
+          <p className="muted" style={{ margin: 0 }}>
+            Live operational view of the Phoenix backend · auto-refresh {POLL_MS / 1000}s
+          </p>
+        </div>
+        <button className="btn-primary" onClick={launchDemo} disabled={demoBusy}>
+          {demoBusy ? "Launching…" : "⚡ Launch Live Demo"}
+        </button>
       </div>
 
       {err && (
@@ -90,19 +130,38 @@ export default function Dashboard() {
           <div className="muted" style={{ fontSize: 11 }}>{rooms.length} total</div>
         </div>
         <div className="card">
-          <div className="muted">Event bus</div>
-          <div className="stat">{eventsPerSec != null ? eventsPerSec.toFixed(1) : "—"}<span style={{ fontSize: 13 }}> /s</span></div>
+          <div className="muted">Events / sec</div>
+          <div className="stat">
+            {eventsPerSec != null ? eventsPerSec.toFixed(1) : "—"}
+            <span style={{ fontSize: 13 }}> /s</span>
+          </div>
           <div className="muted" style={{ fontSize: 11 }}>
-            {metrics?.events_published != null ? `${metrics.events_published.toLocaleString()} total events` : "events/sec"}
+            {metrics?.events_published != null
+              ? `${metrics.events_published.toLocaleString()} total events`
+              : "event bus throughput"}
           </div>
         </div>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: "1.4fr 1fr", gap: 24, alignItems: "start" }}>
+      {/* Live events/sec line chart */}
+      <div className="card">
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+          <strong>Event bus throughput</strong>
+          <span className="muted" style={{ fontSize: 12 }}>
+            events/sec · last {MAX_SAMPLES} samples
+          </span>
+        </div>
+        <Sparkline data={series} />
+      </div>
+
+      <div
+        className="grid"
+        style={{ gridTemplateColumns: "1.4fr 1fr", gap: 24, alignItems: "start" }}
+      >
         {/* Rooms */}
         <div className="card">
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
-            <strong>Rooms</strong>
+            <strong>Active sessions</strong>
             <span className="muted">live</span>
           </div>
           <table>
@@ -121,7 +180,11 @@ export default function Dashboard() {
                   <td>
                     <Link href={`/admin/rooms/${r.id}`}>{r.id.slice(0, 8)}…</Link>
                   </td>
-                  <td>{r.game_type}</td>
+                  <td>
+                    <span className={`badge ${r.game_type === "arena" ? "playing" : "open"}`}>
+                      {r.game_type}
+                    </span>
+                  </td>
                   <td>
                     <span className={`badge ${statusClass(r.status)}`}>{r.status}</span>
                   </td>
@@ -138,7 +201,8 @@ export default function Dashboard() {
               {rooms.length === 0 && !err && (
                 <tr>
                   <td colSpan={5} className="muted">
-                    No rooms yet. Start a match from <Link href="/play">/play</Link>.
+                    No rooms yet. Hit <strong>⚡ Launch Live Demo</strong> or start a match from{" "}
+                    <Link href="/play">/play</Link> · <Link href="/arena">/arena</Link>.
                   </td>
                 </tr>
               )}
@@ -187,5 +251,66 @@ export default function Dashboard() {
         </div>
       </div>
     </div>
+  );
+}
+
+// Hand-rolled SVG line chart — no chart deps.
+function Sparkline({ data }: { data: number[] }) {
+  const W = 720;
+  const H = 120;
+  const PAD = 8;
+
+  const { path, area, max } = useMemo(() => {
+    if (data.length < 2) return { path: "", area: "", max: 0 };
+    const mx = Math.max(1, ...data);
+    const n = data.length;
+    const x = (i: number) => PAD + (i / (n - 1)) * (W - PAD * 2);
+    const y = (v: number) => H - PAD - (v / mx) * (H - PAD * 2);
+    const pts = data.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`);
+    const line = `M ${pts.join(" L ")}`;
+    const fill = `${line} L ${x(n - 1).toFixed(1)},${H - PAD} L ${x(0).toFixed(1)},${H - PAD} Z`;
+    return { path: line, area: fill, max: mx };
+  }, [data]);
+
+  if (data.length < 2) {
+    return (
+      <div style={{ height: H, display: "flex", alignItems: "center" }}>
+        <span className="muted" style={{ fontSize: 13 }}>
+          Collecting samples… (needs the backend live)
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      preserveAspectRatio="none"
+      style={{ width: "100%", height: H, display: "block" }}
+    >
+      <defs>
+        <linearGradient id="epsFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#ff6b3d" stopOpacity="0.35" />
+          <stop offset="100%" stopColor="#ff6b3d" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {/* gridlines */}
+      {[0.25, 0.5, 0.75].map((f) => (
+        <line
+          key={f}
+          x1={PAD}
+          x2={W - PAD}
+          y1={PAD + f * (H - PAD * 2)}
+          y2={PAD + f * (H - PAD * 2)}
+          stroke="#232a3b"
+          strokeWidth={1}
+        />
+      ))}
+      <path d={area} fill="url(#epsFill)" />
+      <path d={path} fill="none" stroke="#ff6b3d" strokeWidth={2} strokeLinejoin="round" />
+      <text x={W - PAD} y={PAD + 12} textAnchor="end" fill="#8b93a7" fontSize={11} fontFamily="monospace">
+        peak {max.toFixed(1)}/s
+      </text>
+    </svg>
   );
 }

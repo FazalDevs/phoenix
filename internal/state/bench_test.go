@@ -25,13 +25,13 @@ func (c *discardConn) Send([]byte)         {}
 // of the database and network.
 func BenchmarkMovePipeline(b *testing.B) {
 	es := store.NewMemory(nil)
-	hub := NewHub(es, Handlers{
+	hub := NewHub(es, map[string]Handlers{"test": {
 		Reducers:  map[string]core.Reducer{"inc": counterReducer},
 		InitState: func() any { return map[string]any{"count": 0} },
-	})
+	}})
 	ctx := context.Background()
 	c := &discardConn{connID: "c1", playerID: "p1", display: "Bench", roomID: "room1"}
-	_ = hub.Join(ctx, c, false)
+	_ = hub.Join(ctx, c, "test", false)
 	raw := []byte(`{"type":"inc","payload":{}}`)
 
 	b.ReportAllocs()
@@ -71,15 +71,15 @@ func BenchmarkRehydrate(b *testing.B) {
 
 		b.Run(fmt.Sprintf("fullReplay/%devents", total), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				h := NewHub(es, Handlers{Reducers: reducers, InitState: initState})
-				_ = h.getOrCreate(ctx, "r") // folds all `total` events
+				h := NewHub(es, map[string]Handlers{"g": {Reducers: reducers, InitState: initState}})
+				_ = h.getOrCreate(ctx, "r", "g") // folds all `total` events
 			}
 		})
 		b.Run(fmt.Sprintf("snapshot/%devents", total), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				h := NewHub(es, Handlers{Reducers: reducers, InitState: initState,
-					Snapshots: snaps, Restore: restore})
-				_ = h.getOrCreate(ctx, "r") // restores snapshot + folds `tail`
+				h := NewHub(es, map[string]Handlers{"g": {Reducers: reducers, InitState: initState,
+					Snapshots: snaps, Restore: restore}})
+				_ = h.getOrCreate(ctx, "r", "g") // restores snapshot + folds `tail`
 			}
 		})
 	}

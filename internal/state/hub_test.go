@@ -49,14 +49,14 @@ func counterReducer(s any, _ core.Event) (any, error) {
 
 func TestEventReducerLoop(t *testing.T) {
 	es := store.NewMemory(nil)
-	hub := NewHub(es, Handlers{
+	hub := NewHub(es, map[string]Handlers{"test": {
 		Reducers:  map[string]core.Reducer{"inc": counterReducer},
 		InitState: func() any { return map[string]any{"count": 0} },
-	})
+	}})
 	ctx := context.Background()
 	c := &fakeConn{connID: "c1", playerID: "p1", display: "Alice", roomID: "room1"}
 
-	if err := hub.Join(ctx, c, false); err != nil {
+	if err := hub.Join(ctx, c, "test", false); err != nil {
 		t.Fatalf("join: %v", err)
 	}
 
@@ -89,11 +89,11 @@ func TestEventReducerLoop(t *testing.T) {
 
 	// Reconnect rebuild: a brand-new hub on the same store must reconstruct
 	// count==3 purely by replaying the log (crash-recovery property).
-	hub2 := NewHub(es, Handlers{
+	hub2 := NewHub(es, map[string]Handlers{"test": {
 		Reducers:  map[string]core.Reducer{"inc": counterReducer, "PlayerJoined": func(s any, _ core.Event) (any, error) { return s, nil }},
 		InitState: func() any { return map[string]any{"count": 0} },
-	})
-	g := hub2.getOrCreate(ctx, "room1")
+	}})
+	g := hub2.getOrCreate(ctx, "room1", "test")
 	g.mu.Lock()
 	rebuilt, _ := g.state.(map[string]any)
 	g.mu.Unlock()

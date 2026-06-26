@@ -89,7 +89,7 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 	// cancel it — this socket is a reconnection, not a fresh join.
 	isReconnect := g.cancelPendingLeave(roomID, u.ID)
 
-	if err := g.hub.Join(ctx, c, isReconnect); err != nil {
+	if err := g.hub.Join(ctx, c, rm.GameType, isReconnect); err != nil {
 		ws.Close(websocket.StatusInternalError, "join failed")
 		cancel()
 		return

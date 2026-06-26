@@ -3,6 +3,10 @@
 // become events, which reducers fold into new state. Because state is a pure
 // fold over the append-only log, any room can be rebuilt from scratch — that is
 // what powers reconnect, crash recovery, and replay.
+//
+// The hub is multi-game: it holds a set of game definitions keyed by game type,
+// and each room runs the reducers for its game. One backend can therefore host
+// chess and a real-time arena (and more) side by side — the platform flex.
 package state
 
 import (
@@ -24,7 +28,7 @@ type Conn interface {
 	Send(msg []byte)
 }
 
-// Handlers is the developer-supplied game logic, registered via the SDK.
+// Handlers is the developer-supplied game logic for one game type.
 type Handlers struct {
 	Reducers  map[string]core.Reducer // eventType -> reducer
 	InitState func() any              // fresh state for a new room
@@ -43,42 +47,68 @@ type Handlers struct {
 	SnapshotEvery int64            // take a snapshot every N events (0 = disabled)
 }
 
-// Hub owns all live room runtimes for one game.
-type Hub struct {
-	store    core.EventStore
-	handlers Handlers
-	mu       sync.Mutex
-	games    map[string]*game // roomID -> runtime
-}
-
-func NewHub(store core.EventStore, h Handlers) *Hub {
+func (h Handlers) withDefaults() Handlers {
 	if h.Reducers == nil {
 		h.Reducers = map[string]core.Reducer{}
 	}
 	if h.InitState == nil {
 		h.InitState = func() any { return map[string]any{} }
 	}
-	return &Hub{store: store, handlers: h, games: make(map[string]*game)}
+	return h
 }
 
-// game is the per-room runtime: members + current state, guarded by a mutex so
-// events for one room apply in a single serialized order.
+// Hub owns all live room runtimes across every registered game.
+type Hub struct {
+	store core.EventStore
+	games map[string]Handlers // gameType -> handlers
+	mu    sync.Mutex
+	rooms map[string]*game // roomID -> runtime
+}
+
+// NewHub builds a hub from a map of gameType -> Handlers.
+func NewHub(store core.EventStore, games map[string]Handlers) *Hub {
+	g := make(map[string]Handlers, len(games))
+	for t, h := range games {
+		g[t] = h.withDefaults()
+	}
+	return &Hub{store: store, games: g, rooms: make(map[string]*game)}
+}
+
+// handlersFor returns the game definition for a type, falling back to a default
+// (empty reducers) if the type isn't registered.
+func (h *Hub) handlersFor(gameType string) Handlers {
+	if hd, ok := h.games[gameType]; ok {
+		return hd
+	}
+	// Fallback: if exactly one game is registered, use it; else an empty default.
+	if len(h.games) == 1 {
+		for _, hd := range h.games {
+			return hd
+		}
+	}
+	return Handlers{}.withDefaults()
+}
+
+// game is the per-room runtime: members + current state + the game's handlers,
+// guarded by a mutex so events for one room apply in a single serialized order.
 type game struct {
-	roomID string
-	hub    *Hub
-	mu     sync.Mutex
-	state  any
-	conns  map[string]Conn
+	roomID   string
+	hub      *Hub
+	handlers Handlers
+	mu       sync.Mutex
+	state    any
+	conns    map[string]Conn
 }
 
 // getOrCreate returns the runtime for roomID, rebuilding its state from the
 // event log on first access (this is reconnect/crash recovery).
-func (h *Hub) getOrCreate(ctx context.Context, roomID string) *game {
+func (h *Hub) getOrCreate(ctx context.Context, roomID, gameType string) *game {
 	h.mu.Lock()
-	g, ok := h.games[roomID]
+	g, ok := h.rooms[roomID]
 	if !ok {
-		g = &game{roomID: roomID, hub: h, state: h.handlers.InitState(), conns: make(map[string]Conn)}
-		h.games[roomID] = g
+		hd := h.handlersFor(gameType)
+		g = &game{roomID: roomID, hub: h, handlers: hd, state: hd.InitState(), conns: make(map[string]Conn)}
+		h.rooms[roomID] = g
 	}
 	h.mu.Unlock()
 
@@ -93,28 +123,27 @@ func (h *Hub) getOrCreate(ctx context.Context, roomID string) *game {
 // folds the entire log from Seq 1 (O(history)). Idempotent because reducers are
 // pure functions of (state, event).
 func (g *game) rebuild(ctx context.Context) {
-	h := g.hub
 	from := int64(1)
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	// Fast path: start from the latest snapshot instead of Seq 1.
-	if h.handlers.Snapshots != nil && h.handlers.Restore != nil {
-		if snap, ok, err := h.handlers.Snapshots.Latest(ctx, g.roomID); err == nil && ok {
-			if st := h.handlers.Restore(snap.State); st != nil {
+	if g.handlers.Snapshots != nil && g.handlers.Restore != nil {
+		if snap, ok, err := g.handlers.Snapshots.Latest(ctx, g.roomID); err == nil && ok {
+			if st := g.handlers.Restore(snap.State); st != nil {
 				g.state = st
 				from = snap.Seq + 1
 			}
 		}
 	}
 
-	events, err := h.store.Load(ctx, g.roomID, from, 0)
+	events, err := g.hub.store.Load(ctx, g.roomID, from, 0)
 	if err != nil {
 		return
 	}
 	for _, e := range events {
-		if r := h.handlers.Reducers[e.Type]; r != nil {
+		if r := g.handlers.Reducers[e.Type]; r != nil {
 			if ns, err := r(g.state, e); err == nil {
 				g.state = ns
 			}
@@ -127,8 +156,8 @@ func (g *game) rebuild(ctx context.Context) {
 // reconnect within the grace window (isReconnect=true) it only re-attaches and
 // re-snapshots — no duplicate join event — because the player never logically
 // left.
-func (h *Hub) Join(ctx context.Context, c Conn, isReconnect bool) error {
-	g := h.getOrCreate(ctx, c.RoomID())
+func (h *Hub) Join(ctx context.Context, c Conn, gameType string, isReconnect bool) error {
+	g := h.getOrCreate(ctx, c.RoomID(), gameType)
 
 	g.mu.Lock()
 	g.conns[c.ConnID()] = c
@@ -137,8 +166,8 @@ func (h *Hub) Join(ctx context.Context, c Conn, isReconnect bool) error {
 
 	if !isReconnect {
 		player := core.Player{ID: c.PlayerID(), DisplayName: c.DisplayName(), RoomID: c.RoomID()}
-		if h.handlers.OnJoin != nil {
-			h.handlers.OnJoin(player)
+		if g.handlers.OnJoin != nil {
+			g.handlers.OnJoin(player)
 		}
 		// Persist join as an event (server-authoritative history) and apply it.
 		payload, _ := core.NewPayload(player)
@@ -155,7 +184,7 @@ func (h *Hub) Join(ctx context.Context, c Conn, isReconnect bool) error {
 // reconnect within the grace window.
 func (h *Hub) Detach(c Conn) {
 	h.mu.Lock()
-	g := h.games[c.RoomID()]
+	g := h.rooms[c.RoomID()]
 	h.mu.Unlock()
 	if g == nil {
 		return
@@ -172,13 +201,13 @@ func (h *Hub) Detach(c Conn) {
 // reconnection.
 func (h *Hub) Leave(ctx context.Context, player core.Player) {
 	h.mu.Lock()
-	g := h.games[player.RoomID]
+	g := h.rooms[player.RoomID]
 	h.mu.Unlock()
 	if g == nil {
 		return
 	}
-	if h.handlers.OnLeave != nil {
-		h.handlers.OnLeave(player)
+	if g.handlers.OnLeave != nil {
+		g.handlers.OnLeave(player)
 	}
 	payload, _ := core.NewPayload(player)
 	_ = h.dispatch(ctx, g, player.ID, "PlayerLeft", payload, false, false)
@@ -189,7 +218,7 @@ func (h *Hub) Leave(ctx context.Context, player core.Player) {
 	g.mu.Unlock()
 	if empty {
 		h.mu.Lock()
-		delete(h.games, player.RoomID)
+		delete(h.rooms, player.RoomID)
 		h.mu.Unlock()
 	}
 }
@@ -219,12 +248,12 @@ func (h *Hub) HandleMessage(ctx context.Context, c Conn, raw []byte) {
 		return
 	}
 	h.mu.Lock()
-	g := h.games[c.RoomID()]
+	g := h.rooms[c.RoomID()]
 	h.mu.Unlock()
 	if g == nil {
 		return
 	}
-	if _, ok := h.handlers.Reducers[in.Type]; !ok {
+	if _, ok := g.handlers.Reducers[in.Type]; !ok {
 		c.Send(mustJSON(outbound{Type: "error", Error: "unknown event type: " + in.Type}))
 		return
 	}
@@ -254,7 +283,7 @@ func (h *Hub) dispatch(ctx context.Context, g *game, playerID, eventType string,
 	}
 
 	newState := prev
-	if r := h.handlers.Reducers[eventType]; r != nil {
+	if r := g.handlers.Reducers[eventType]; r != nil {
 		ns, err := r(prev, *e)
 		if err != nil {
 			if validate {
@@ -288,16 +317,17 @@ func (h *Hub) dispatch(ctx context.Context, g *game, playerID, eventType string,
 	// Compute derived domain events from this transition. Only original events
 	// derive (derived==false), so emitted events never recurse.
 	var derivedEvents []core.DerivedEvent
-	if !derived && h.handlers.Derive != nil {
-		derivedEvents = h.handlers.Derive(prev, newState, *e)
+	if !derived && g.handlers.Derive != nil {
+		derivedEvents = g.handlers.Derive(prev, newState, *e)
 	}
 
 	// If a snapshot is due, capture the encoded state under the lock (so it's a
 	// consistent point-in-time copy); persist it asynchronously off the hot path.
 	var snapBytes []byte
-	if h.handlers.Snapshots != nil && h.handlers.SnapshotEvery > 0 && e.Seq%h.handlers.SnapshotEvery == 0 {
+	if g.handlers.Snapshots != nil && g.handlers.SnapshotEvery > 0 && e.Seq%g.handlers.SnapshotEvery == 0 {
 		snapBytes = mustJSON(newState)
 	}
+	snaps := g.handlers.Snapshots
 	g.mu.Unlock()
 
 	// Broadcast the authoritative delta to the room's players synchronously
@@ -306,10 +336,10 @@ func (h *Hub) dispatch(ctx context.Context, g *game, playerID, eventType string,
 		c.Send(msg)
 	}
 
-	if snapBytes != nil {
+	if snapBytes != nil && snaps != nil {
 		seq := e.Seq
 		go func() {
-			_ = h.handlers.Snapshots.Save(context.Background(),
+			_ = snaps.Save(context.Background(),
 				core.Snapshot{RoomID: g.roomID, Seq: seq, State: snapBytes})
 		}()
 	}
@@ -332,15 +362,15 @@ type Stats struct {
 // Stats returns current live membership counts across all rooms.
 func (h *Hub) Stats() Stats {
 	h.mu.Lock()
-	games := make([]*game, 0, len(h.games))
-	for _, g := range h.games {
-		games = append(games, g)
+	rooms := make([]*game, 0, len(h.rooms))
+	for _, g := range h.rooms {
+		rooms = append(rooms, g)
 	}
 	h.mu.Unlock()
 
 	s := Stats{PerRoom: make(map[string]int)}
 	seen := make(map[string]struct{})
-	for _, g := range games {
+	for _, g := range rooms {
 		g.mu.Lock()
 		n := len(g.conns)
 		for _, c := range g.conns {
@@ -356,19 +386,17 @@ func (h *Hub) Stats() Stats {
 	return s
 }
 
-// CurrentState returns a copy-by-reference of a room's current reduced state,
-// for the admin live-view. nil if the room is not currently active in memory.
+// CurrentState returns a detached, already-encoded snapshot of a room's current
+// reduced state for the admin live-view. nil if the room isn't active in memory.
 func (h *Hub) CurrentState(roomID string) (any, bool) {
 	h.mu.Lock()
-	g := h.games[roomID]
+	g := h.rooms[roomID]
 	h.mu.Unlock()
 	if g == nil {
 		return nil, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	// Return a detached, already-encoded snapshot so callers can marshal it
-	// without racing a concurrent in-place state mutation.
 	return json.RawMessage(mustJSON(g.state)), true
 }
 

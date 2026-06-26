@@ -1,7 +1,7 @@
-// Command phoenix is the reference Phoenix server. It boots the full platform
-// with a tiny generic game so the backend and dashboard are usable on their
-// own. A real game would replace these reducers with its own rules — see the
-// chess demo (later) for that pattern.
+// Command phoenix is a minimal generic server: a "sandbox" game that accepts a
+// few event types and folds their payloads into per-player state. Useful for
+// smoke-testing the platform without real game rules. The real demo backend is
+// cmd/server (chess + arena).
 package main
 
 import (
@@ -12,35 +12,19 @@ import (
 )
 
 func main() {
-	game := phoenix.New(phoenix.WithGameType("sandbox"))
+	app := phoenix.New()
+	app.Game("sandbox").
+		InitialState(func() any { return map[string]any{"players": map[string]any{}, "events": 0} }).
+		OnEvent("move", generic("move")).
+		OnEvent("chat", generic("chat")).
+		OnEvent("action", generic("action"))
 
-	// Starting state: an empty bag of per-player data plus an event counter.
-	game.InitialState(func() any {
-		return map[string]any{"players": map[string]any{}, "events": 0}
-	})
-
-	game.OnJoin(func(p phoenix.Player) {
-		log.Printf("join: %s (%s) -> room %s", p.DisplayName, p.ID, p.RoomID)
-	})
-	game.OnLeave(func(p phoenix.Player) {
-		log.Printf("leave: %s -> room %s", p.DisplayName, p.RoomID)
-	})
-
-	// Generic reducers so the reference server accepts common events. Each folds
-	// the event payload into per-player state — the Move -> Event -> Reducer ->
-	// New State loop, with no game-specific logic.
-	game.OnEvent("move", genericReduce("move"))
-	game.OnEvent("chat", genericReduce("chat"))
-	game.OnEvent("action", genericReduce("action"))
-
-	if err := game.Run(); err != nil {
+	if err := app.Run(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// genericReduce stores the latest payload for an event type under the actor and
-// bumps the event counter. Demonstrates immutable-ish state evolution.
-func genericReduce(kind string) phoenix.Reducer {
+func generic(kind string) phoenix.Reducer {
 	return func(s any, e phoenix.Event) (any, error) {
 		st, _ := s.(map[string]any)
 		if st == nil {

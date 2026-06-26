@@ -7,7 +7,9 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"time"
 
+	"github.com/fazal/phoenix/internal/bots"
 	"github.com/fazal/phoenix/internal/core"
 	"github.com/fazal/phoenix/internal/eventbus"
 	"github.com/fazal/phoenix/internal/httpx"
@@ -23,10 +25,11 @@ type Handler struct {
 	pool     *pgxpool.Pool
 	bus      eventbus.Bus
 	presence core.PresenceStore // may be nil if Redis is unavailable
+	bots     *bots.Runner
 }
 
-func NewHandler(store core.EventStore, rooms *room.Service, hub *state.Hub, pool *pgxpool.Pool, bus eventbus.Bus, presence core.PresenceStore) *Handler {
-	return &Handler{store: store, rooms: rooms, hub: hub, pool: pool, bus: bus, presence: presence}
+func NewHandler(store core.EventStore, rooms *room.Service, hub *state.Hub, pool *pgxpool.Pool, bus eventbus.Bus, presence core.PresenceStore, botRunner *bots.Runner) *Handler {
+	return &Handler{store: store, rooms: rooms, hub: hub, pool: pool, bus: bus, presence: presence, bots: botRunner}
 }
 
 func (h *Handler) Routes(mux *http.ServeMux) {
@@ -37,6 +40,26 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /admin/rooms/{id}/state", h.roomState)
 	mux.HandleFunc("POST /admin/rooms/{id}/terminate", h.terminate)
 	mux.HandleFunc("POST /admin/users/{id}/ban", h.ban)
+	mux.HandleFunc("POST /admin/demo", h.demo)
+}
+
+// demo spawns a room of wandering arena bots so the dashboard is lively on
+// demand. POST /admin/demo?bots=8 -> { room, ws }.
+func (h *Handler) demo(w http.ResponseWriter, r *http.Request) {
+	if h.bots == nil {
+		httpx.WriteErr(w, http.StatusServiceUnavailable, "bots unavailable")
+		return
+	}
+	n, _ := strconv.Atoi(r.URL.Query().Get("bots"))
+	if n == 0 {
+		n = 8
+	}
+	roomID, err := h.bots.LaunchArena(n, 60*time.Second)
+	if err != nil {
+		httpx.WriteErr(w, http.StatusInternalServerError, "demo failed")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"room": roomID, "ws": "/ws?room=" + roomID})
 }
 
 // metrics returns live counters for the dashboard: live socket stats from the

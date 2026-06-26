@@ -4,8 +4,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link";
 import { Chessboard } from "react-chessboard";
 import { Chess } from "chess.js";
-import { api, PhoenixEvent } from "@/lib/api";
+import { api, PhoenixEvent, ArenaState, isArenaState } from "@/lib/api";
 import { ReconnectingSocket, WsStatus, adminStreamUrl } from "@/lib/ws";
+import ArenaCanvas from "@/components/ArenaCanvas";
 
 const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
@@ -46,9 +47,17 @@ function LiveStream({ roomId }: { roomId: string }) {
   const [events, setEvents] = useState<PhoenixEvent[]>([]);
   const [state, setState] = useState<any>(null);
   const [status, setStatus] = useState<WsStatus>("closed");
+  const [gameType, setGameType] = useState<string | null>(null);
   const feedRef = useRef<HTMLDivElement | null>(null);
+  // live arena state for the read-only canvas (read each animation frame)
+  const arenaRef = useRef<ArenaState | null>(null);
 
-  // seed with existing log + state, then stream live
+  const updateState = useCallback((st: any) => {
+    setState(st);
+    if (isArenaState(st)) arenaRef.current = st;
+  }, []);
+
+  // seed with existing log + state + room metadata, then stream live
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -56,15 +65,23 @@ function LiveStream({ roomId }: { roomId: string }) {
         const [ev, st] = await Promise.all([api.events(roomId), api.roomState(roomId)]);
         if (cancelled) return;
         setEvents(ev);
-        setState(st.state ?? null);
+        updateState(st.state ?? null);
       } catch {
         /* backend may be down or room empty */
+      }
+      try {
+        const all = await api.rooms();
+        if (cancelled) return;
+        const found = all.find((r) => r.id === roomId);
+        if (found) setGameType(found.game_type);
+      } catch {
+        /* ignore */
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [roomId]);
+  }, [roomId, updateState]);
 
   useEffect(() => {
     const sock = new ReconnectingSocket(adminStreamUrl(roomId), {
@@ -76,15 +93,15 @@ function LiveStream({ roomId }: { roomId: string }) {
             if (prev.some((e) => e.seq === ev.seq)) return prev;
             return [...prev, ev];
           });
-          if ((msg as any).state) setState((msg as any).state);
+          if ((msg as any).state) updateState((msg as any).state);
         } else if (msg.type === "snapshot" && (msg as any).state) {
-          setState((msg as any).state);
+          updateState((msg as any).state);
         }
       },
     });
     sock.connect();
     return () => sock.close();
-  }, [roomId]);
+  }, [roomId, updateState]);
 
   // newest at top
   const ordered = useMemo(() => [...events].sort((a, b) => b.seq - a.seq), [events]);
@@ -95,6 +112,7 @@ function LiveStream({ roomId }: { roomId: string }) {
   }, [ordered.length]);
 
   const fen: string | null = state?.fen ?? null;
+  const isArena = gameType === "arena" || isArenaState(state);
 
   return (
     <div className="grid" style={{ gap: 24, gridTemplateColumns: "1fr 360px", alignItems: "start" }}>
@@ -137,8 +155,16 @@ function LiveStream({ roomId }: { roomId: string }) {
       </div>
 
       <div className="card">
-        <div className="section-title" style={{ marginBottom: 12 }}>Board</div>
-        {fen ? (
+        <div className="section-title" style={{ marginBottom: 12 }}>
+          {isArena ? "Arena (live)" : "Board"}
+        </div>
+        {isArena ? (
+          isArenaState(state) ? (
+            <ArenaCanvas stateRef={arenaRef} selfId={null} maxWidth={360} />
+          ) : (
+            <p className="muted">Arena room inactive — no live state.</p>
+          )
+        ) : fen ? (
           <Chessboard
             position={fen}
             arePiecesDraggable={false}

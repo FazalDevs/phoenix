@@ -13,6 +13,7 @@ import (
 	"github.com/fazal/phoenix/deploy/migrations"
 	"github.com/fazal/phoenix/internal/admin"
 	"github.com/fazal/phoenix/internal/auth"
+	"github.com/fazal/phoenix/internal/bots"
 	"github.com/fazal/phoenix/internal/config"
 	"github.com/fazal/phoenix/internal/core"
 	"github.com/fazal/phoenix/internal/eventbus"
@@ -27,11 +28,17 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Engine is the developer-facing handle to Phoenix. A game registers its rules
-// (OnJoin/OnLeave/OnEvent) and calls Run; Phoenix boots the entire backend —
-// auth, rooms, WebSocket gateway, event store, state engine, and admin API —
-// against this one game. This is the "import the SDK, add rules, deploy" model.
+// Engine is the developer-facing handle to Phoenix. Register one or more games
+// (each a set of reducers) and call Run; Phoenix boots the entire backend — auth,
+// rooms, WebSocket gateway, event store, state engine, projections, and admin API
+// — hosting all registered games on one process. "Import the SDK, add rules, deploy."
 type Engine struct {
+	games map[string]*Game
+	store EventStore // optional override (defaults to Postgres)
+}
+
+// Game holds the rules for a single game type.
+type Game struct {
 	gameType      string
 	reducers      map[string]Reducer
 	onJoin        func(Player)
@@ -40,66 +47,70 @@ type Engine struct {
 	derive        Deriver
 	restore       func([]byte) any
 	snapshotEvery int64
-
-	store EventStore // optional override (defaults to Postgres)
 }
 
 // Option configures the Engine.
 type Option func(*Engine)
 
-// WithGameType labels rooms created by this engine (e.g. "chess").
-func WithGameType(t string) Option { return func(e *Engine) { e.gameType = t } }
-
 // WithEventStore injects a custom EventStore (e.g. in-memory for tests). When
-// unset, Phoenix uses the bundled Postgres store. This is the plugin seam in
-// action — the engine never assumes a concrete store.
+// unset, Phoenix uses the bundled Postgres store — the plugin seam in action.
 func WithEventStore(s EventStore) Option { return func(e *Engine) { e.store = s } }
 
-// WithSnapshotEvery enables state snapshots every n events. Combined with
-// RestoreState, room rehydration (reconnect / crash recovery) restores the
-// latest snapshot and folds only the events after it, bounding recovery cost.
-func WithSnapshotEvery(n int64) Option { return func(e *Engine) { e.snapshotEvery = n } }
-
-// New creates an Engine with sane defaults.
+// New creates an Engine.
 func New(opts ...Option) *Engine {
-	e := &Engine{
-		gameType:  "game",
-		reducers:  make(map[string]Reducer),
-		initState: func() any { return map[string]any{} },
-	}
+	e := &Engine{games: make(map[string]*Game)}
 	for _, o := range opts {
 		o(e)
 	}
 	return e
 }
 
-// OnJoin registers a callback fired when a player joins a room.
-func (e *Engine) OnJoin(f func(Player)) { e.onJoin = f }
+// Game returns the registration for a game type, creating it on first use. Call
+// its OnEvent/OnJoin/etc. to define the rules.
+func (e *Engine) Game(gameType string) *Game {
+	if g, ok := e.games[gameType]; ok {
+		return g
+	}
+	g := &Game{
+		gameType:  gameType,
+		reducers:  make(map[string]Reducer),
+		initState: func() any { return map[string]any{} },
+	}
+	e.games[gameType] = g
+	return g
+}
 
-// OnLeave registers a callback fired when a player leaves a room.
-func (e *Engine) OnLeave(f func(Player)) { e.onLeave = f }
+// OnJoin registers a callback fired when a player joins a room of this game.
+func (g *Game) OnJoin(f func(Player)) *Game { g.onJoin = f; return g }
+
+// OnLeave registers a callback fired when a player leaves.
+func (g *Game) OnLeave(f func(Player)) *Game { g.onLeave = f; return g }
 
 // OnEvent registers the reducer for an event type. The reducer folds the event
-// into prior state and returns new state. Keep it pure for deterministic replay.
-func (e *Engine) OnEvent(eventType string, r Reducer) { e.reducers[eventType] = r }
+// into prior state and returns new state. Keep it deterministic for replay.
+func (g *Game) OnEvent(eventType string, r Reducer) *Game { g.reducers[eventType] = r; return g }
 
 // InitialState sets the factory for a new room's starting state.
-func (e *Engine) InitialState(f func() any) { e.initState = f }
+func (g *Game) InitialState(f func() any) *Game { g.initState = f; return g }
 
-// Derive registers a function that emits server-authored domain events from a
-// state transition (e.g. MatchStarted/MatchEnded). These flow through the same
-// persist -> publish -> broadcast pipeline, so bus consumers (leaderboard, etc.)
-// react to meaningful domain events.
-func (e *Engine) Derive(f Deriver) { e.derive = f }
+// Derive emits server-authored domain events from a state transition (e.g.
+// MatchStarted/MatchEnded) — these flow through the same persist->publish path.
+func (g *Game) Derive(f Deriver) *Game { g.derive = f; return g }
 
-// RestoreState registers a decoder that turns a snapshot's JSON back into the
-// game's typed state. Required for snapshots (see WithSnapshotEvery), since the
-// engine stores state as an opaque value it can't otherwise reconstruct.
-func (e *Engine) RestoreState(f func([]byte) any) { e.restore = f }
+// RestoreState decodes a snapshot's JSON back into the game's typed state.
+// Required to enable snapshots (see SnapshotEvery).
+func (g *Game) RestoreState(f func([]byte) any) *Game { g.restore = f; return g }
 
-// Run boots the full backend and blocks until the process is signalled. It
-// returns an error only on a fatal startup or shutdown failure.
+// SnapshotEvery enables state snapshots every n events; rehydration then folds
+// only the tail of the log instead of replaying the whole match.
+func (g *Game) SnapshotEvery(n int64) *Game { g.snapshotEvery = n; return g }
+
+// Run boots the full backend and blocks until signalled.
 func (e *Engine) Run() error {
+	if len(e.games) == 0 {
+		return errors.New("no games registered: call engine.Game(...).OnEvent(...) first")
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err
@@ -114,17 +125,12 @@ func (e *Engine) Run() error {
 	if err := pool.Ping(ctx); err != nil {
 		return errors.New("cannot reach postgres: " + err.Error())
 	}
-
-	// Apply the embedded schema so Phoenix boots against any empty Postgres
-	// (local, Neon, Supabase, RDS) with no manual migration step.
 	if err := migrations.Apply(ctx, pool); err != nil {
 		return errors.New("migrations failed: " + err.Error())
 	}
 
-	// The event bus: the store publishes appended events to it; consumer
-	// services (presence, leaderboard, dashboard stream) subscribe and react
-	// asynchronously. PHOENIX_BUS=redis makes it cluster-wide (multi-node) by
-	// fanning events through Redis; otherwise it's a fast in-process bus.
+	// Event bus: store publishes appended events; consumers react. PHOENIX_BUS=
+	// redis makes it cluster-wide (multi-node).
 	var bus eventbus.Bus = eventbus.NewInProcess()
 	if os.Getenv("PHOENIX_BUS") == "redis" {
 		if rb, err := eventbus.NewRedisBus(cfg.RedisURL); err != nil {
@@ -135,11 +141,34 @@ func (e *Engine) Run() error {
 		}
 	}
 
-	// EventStore: injected override or default Postgres (the plugin seam). The
-	// store publishes to the bus after each durable append.
 	es := e.store
 	if es == nil {
 		es = store.NewFromPool(pool, bus)
+	}
+
+	// Shared snapshot store, used by any game that enabled snapshots.
+	snapStore := store.NewPostgresSnapshots(pool)
+	if err := snapStore.EnsureSchema(ctx); err != nil {
+		log.Printf("phoenix: snapshots schema: %v", err)
+	}
+
+	// Build the per-game handler map for the multi-game hub.
+	handlers := make(map[string]state.Handlers, len(e.games))
+	for t, g := range e.games {
+		h := state.Handlers{
+			Reducers:  g.reducers,
+			InitState: g.initState,
+			OnJoin:    g.onJoin,
+			OnLeave:   g.onLeave,
+			Derive:    g.derive,
+		}
+		if g.restore != nil && g.snapshotEvery > 0 {
+			h.Snapshots = snapStore
+			h.Restore = g.restore
+			h.SnapshotEvery = g.snapshotEvery
+		}
+		handlers[t] = h
+		log.Printf("phoenix: game registered: %q (%d event types)", t, len(g.reducers))
 	}
 
 	authSvc := auth.NewService(pool, cfg.JWTSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
@@ -149,35 +178,10 @@ func (e *Engine) Run() error {
 	mmSvc := matchmaking.NewService(roomSvc)
 	mmH := matchmaking.NewHandler(mmSvc)
 
-	// Snapshots (optional): bound rehydration cost for long matches. Requires a
-	// RestoreState decoder and a snapshot interval.
-	var snaps core.SnapshotStore
-	if e.restore != nil && e.snapshotEvery > 0 {
-		ps := store.NewPostgresSnapshots(pool)
-		if err := ps.EnsureSchema(ctx); err != nil {
-			log.Printf("phoenix: snapshots disabled (schema: %v)", err)
-		} else {
-			snaps = ps
-			log.Printf("phoenix: snapshots every %d events", e.snapshotEvery)
-		}
-	}
-
-	hub := state.NewHub(es, state.Handlers{
-		Reducers:      e.reducers,
-		InitState:     e.initState,
-		OnJoin:        e.onJoin,
-		OnLeave:       e.onLeave,
-		Derive:        e.derive,
-		Snapshots:     snaps,
-		Restore:       e.restore,
-		SnapshotEvery: e.snapshotEvery,
-	})
+	hub := state.NewHub(es, handlers)
 	gw := gateway.New(authH, authSvc, roomSvc, hub, cfg.HeartbeatInterval, cfg.ReconnectWindow)
 
-	// --- bus consumers (event-driven read models / projections) --------------
-
-	// Presence (Redis). Best-effort: if Redis is down the platform still runs,
-	// just without live presence — a slow/absent consumer never affects games.
+	// Presence (Redis) — best-effort.
 	var pres core.PresenceStore
 	if p, err := presence.NewRedis(ctx, cfg.RedisURL); err != nil {
 		log.Printf("phoenix: presence disabled (redis: %v)", err)
@@ -186,8 +190,7 @@ func (e *Engine) Run() error {
 		bus.Subscribe("presence", p.Handle)
 	}
 
-	// Leaderboard (Postgres read model). Rebuild from the log on boot, then keep
-	// it current by reacting to MatchEnded events from the bus.
+	// Leaderboard (Postgres read model) — rebuild on boot, then follow the bus.
 	lb := leaderboard.NewService(pool)
 	if err := lb.EnsureSchema(ctx); err != nil {
 		log.Printf("phoenix: leaderboard schema: %v", err)
@@ -198,17 +201,16 @@ func (e *Engine) Run() error {
 	bus.Subscribe("leaderboard", lb.Handle)
 	lbH := leaderboard.NewHandler(lb)
 
-	adminH := admin.NewHandler(es, roomSvc, hub, pool, bus, pres)
+	botRunner := bots.NewRunner(hub, roomSvc, authSvc)
+	adminH := admin.NewHandler(es, roomSvc, hub, pool, bus, pres, botRunner)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("/ws", gw.ServeWS) // auth handled inside the handshake
+	mux.HandleFunc("/ws", gw.ServeWS)
 	authH.Routes(mux)
 	adminH.Routes(mux)
 	lbH.Routes(mux)
 
-	// Room + matchmaking routes work anonymously but pick up the owner when a
-	// token is present.
 	openMux := http.NewServeMux()
 	roomH.Routes(openMux)
 	mmH.Routes(openMux)
@@ -216,13 +218,8 @@ func (e *Engine) Run() error {
 	mux.Handle("/rooms/", authH.Optional(openMux))
 	mux.Handle("/matchmake", authH.Optional(openMux))
 
-	srv := &http.Server{
-		Addr:        ":" + cfg.Port,
-		Handler:     httpx.CORS(mux),
-		ReadTimeout: 0, // WebSockets are long-lived
-	}
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: httpx.CORS(mux), ReadTimeout: 0}
 
-	// Graceful shutdown on SIGINT/SIGTERM.
 	go func() {
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -233,7 +230,7 @@ func (e *Engine) Run() error {
 		_ = srv.Shutdown(sctx)
 	}()
 
-	log.Printf("phoenix: game=%q listening on :%s", e.gameType, cfg.Port)
+	log.Printf("phoenix: listening on :%s", cfg.Port)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

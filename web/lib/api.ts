@@ -70,6 +70,38 @@ export type ChessState = {
   history: string[];
 };
 
+export type ArenaPlayer = {
+  x: number;
+  y: number;
+  score: number;
+  name: string;
+  color: string;
+};
+
+export type ArenaFood = { id: number; x: number; y: number };
+
+export type ArenaState = {
+  w: number;
+  h: number;
+  players: Record<string, ArenaPlayer>;
+  food: ArenaFood[];
+};
+
+// Heuristic: does an arbitrary reduced state look like an arena game state?
+export function isArenaState(s: any): s is ArenaState {
+  return (
+    !!s &&
+    typeof s === "object" &&
+    typeof s.w === "number" &&
+    typeof s.h === "number" &&
+    !!s.players &&
+    typeof s.players === "object" &&
+    Array.isArray(s.food)
+  );
+}
+
+export type LaunchDemoResponse = { room: string; ws: string };
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`${res.status} ${path}`);
@@ -97,6 +129,7 @@ export const api = {
     post<MatchmakeResponse>(`/matchmake?game=${encodeURIComponent(game)}`, undefined, token),
 
   // admin
+  launchDemo: (bots = 8) => post<LaunchDemoResponse>(`/admin/demo?bots=${bots}`),
   metrics: () => get<Metrics>("/admin/metrics"),
   rooms: () => get<Room[]>("/admin/rooms"),
   leaderboard: () => get<Standing[]>("/leaderboard"),
