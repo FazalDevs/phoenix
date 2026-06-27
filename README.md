@@ -4,6 +4,18 @@ A reusable, event-sourced **multiplayer backend platform** in Go. Write only you
 game rules; Phoenix handles auth, rooms, WebSockets, state sync, persistence,
 replay, presence, leaderboards, and scaling.
 
+## Live demo
+
+**https://phoenix-blush-eight.vercel.app**
+
+- `/play` — online chess (open two tabs to play yourself)
+- `/arena` — real-time multiplayer arena (arrow keys / WASD)
+- `/admin` — Mission Control: hit **⚡ Launch Live Demo** to spawn bots, then watch
+  the arena move live with an events/sec chart, presence, and leaderboard
+
+One backend hosts both games — the platform powers them; you only write the rules.
+(Backend on a free tier may cold-start for ~30s on first load.)
+
 ```go
 game := phoenix.New(cfg)
 game.OnJoin(playerJoined)
