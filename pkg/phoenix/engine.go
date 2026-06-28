@@ -143,7 +143,14 @@ func (e *Engine) Run() error {
 
 	es := e.store
 	if es == nil {
-		es = store.NewFromPool(pool, bus)
+		if os.Getenv("PHOENIX_STORE") == "batched" {
+			bs := store.NewBatched(pool, bus, 512, 2*time.Millisecond)
+			defer bs.Close() // flush on shutdown
+			es = bs
+			log.Println("phoenix: batched async event store")
+		} else {
+			es = store.NewFromPool(pool, bus)
+		}
 	}
 
 	// Shared snapshot store, used by any game that enabled snapshots.
